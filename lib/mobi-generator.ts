@@ -2,12 +2,44 @@
  * MOBI/AZW3 binary format generator.
  * Generates Kindle-compatible MOBI (MobiPocket) files.
  * The PalmDOC + MOBI6 format is natively supported by all Kindle devices.
+ * Images embedded as base64 data URIs in the HTML are extracted and stored
+ * as binary image records in the PalmDB file.
  */
 
 interface MobiContent {
   title: string;
   author: string;
   html: string;
+}
+
+interface ExtractedImage {
+  data: Buffer;
+  mimeType: string;
+}
+
+/** Number of digits used in Kindle image reference indices (e.g., "0001"). */
+const KINDLE_IMAGE_INDEX_WIDTH = 4;
+
+/**
+ * Extract all base64 data URI images from HTML, replace each with a
+ * kindle:image reference, and return the processed HTML plus image buffers.
+ * Kindle uses 1-indexed recindex relative to the first image record.
+ */
+function extractImages(html: string): { html: string; images: ExtractedImage[] } {
+  const images: ExtractedImage[] = [];
+  const processed = html.replace(
+    /(<img\b[^>]*?)\bsrc="data:(image\/[^;]+);base64,([^"]+)"([^>]*?>)/gi,
+    (_match, pre, mimeType, base64Data, post) => {
+      const idx = images.length + 1; // 1-indexed
+      images.push({
+        data: Buffer.from(base64Data, 'base64'),
+        mimeType: mimeType.toLowerCase(),
+      });
+      const recAttr = `src="kindle:image:${String(idx).padStart(KINDLE_IMAGE_INDEX_WIDTH, '0')}"`;
+      return `${pre}${recAttr}${post}`;
+    }
+  );
+  return { html: processed, images };
 }
 
 /** Convert Unix timestamp to Palm epoch (seconds since Jan 1, 1904). */
@@ -52,7 +84,13 @@ function buildExthHeader(title: string, author: string): Buffer {
   return exth;
 }
 
-function buildRecord0(title: string, author: string, numTextRecords: number, textLength: number): Buffer {
+function buildRecord0(
+  title: string,
+  author: string,
+  numTextRecords: number,
+  textLength: number,
+  firstImageIndex: number
+): Buffer {
   const titleBytes = Buffer.from(title, 'utf8');
   const exthHeader = buildExthHeader(title, author);
 
@@ -86,7 +124,7 @@ function buildRecord0(title: string, author: string, numTextRecords: number, tex
 
   w32(mobi, 76, 0x0409);          // locale: English US
   w32(mobi, 88, 6);               // min version
-  w32(mobi, 92, firstNonBook);    // first image index
+  w32(mobi, 92, firstImageIndex); // first image record index
 
   // Huff/CDIC: none
   w32(mobi, 96, 0);
@@ -129,7 +167,10 @@ function buildRecord0(title: string, author: string, numTextRecords: number, tex
  * The resulting file uses .azw3 extension and is readable by all Kindle devices/apps.
  */
 export function generateMobi(content: MobiContent): Buffer {
-  const { title, author, html } = content;
+  const { title, author } = content;
+
+  // Extract base64 images from HTML, replacing with kindle:image references
+  const { html: processedHtml, images } = extractImages(content.html);
 
   // Wrap HTML in minimal document structure
   const fullHtml = [
@@ -145,10 +186,11 @@ export function generateMobi(content: MobiContent): Buffer {
     'h1:first-child, h2:first-child, h3:first-child { page-break-before: avoid; }',
     'p { margin: 0.5em 0; text-indent: 1.5em; }',
     'p.noindent { text-indent: 0; }',
+    'img { max-width: 100%; }',
     '</style>',
     '</head>',
     '<body>',
-    html,
+    processedHtml,
     '</body>',
     '</html>',
   ].join('\n');
@@ -162,8 +204,15 @@ export function generateMobi(content: MobiContent): Buffer {
   }
   if (textRecords.length === 0) textRecords.push(Buffer.alloc(0));
 
-  const record0 = buildRecord0(title, author, textRecords.length, htmlBuf.length);
-  const allRecords: Buffer[] = [record0, ...textRecords];
+  // First image record is immediately after text records (record 0 is header, then text records)
+  const firstImageIndex = 1 + textRecords.length;
+
+  const record0 = buildRecord0(title, author, textRecords.length, htmlBuf.length, firstImageIndex);
+
+  // Image records (raw image bytes, one record per image)
+  const imageRecords: Buffer[] = images.map((img) => img.data);
+
+  const allRecords: Buffer[] = [record0, ...textRecords, ...imageRecords];
   const numRecords = allRecords.length;
 
   // Palm header: 78 bytes

@@ -1,6 +1,8 @@
 /**
  * EPUB parser: reads EPUB files (ZIP archives) and extracts
- * title, author, and ordered HTML chapter content.
+ * title, author, ordered HTML chapter content, and embedded images.
+ * Images are embedded as base64 data URIs in the HTML so they can be
+ * included in the output MOBI/AZW3 file.
  */
 
 import JSZip from 'jszip';
@@ -82,8 +84,30 @@ function removeTagIterative(html: string, tag: string): string {
   return result;
 }
 
+/** Replace relative image src attributes with base64 data URIs from imageMap. */
+function replaceImageSrcs(
+  html: string,
+  imageMap: Map<string, string>,
+  chapterPath: string
+): string {
+  return html.replace(/(<img\b[^>]*?\bsrc=")([^"]+)(")/gi, (_match, pre, src, post) => {
+    if (src.startsWith('data:') || src.startsWith('http')) return pre + src + post;
+    const resolved = resolvePath(chapterPath, src);
+    const dataUri =
+      imageMap.get(resolved) ??
+      imageMap.get(src) ??
+      imageMap.get(src.split('/').pop() ?? '');
+    if (dataUri) return pre + dataUri + post;
+    return pre + src + post;
+  });
+}
+
 /** Clean HTML from an EPUB chapter for Kindle compatibility. */
-function cleanChapterHtml(raw: string): string {
+function cleanChapterHtml(
+  raw: string,
+  imageMap: Map<string, string>,
+  chapterPath: string
+): string {
   let html = raw;
 
   // Remove XML declaration and DOCTYPE
@@ -95,12 +119,14 @@ function cleanChapterHtml(raw: string): string {
 
   // Iteratively remove dangerous tags until no more matches
   html = removeTagIterative(html, 'script');
-  html = removeTagIterative(html, 'style');
   html = removeTagIterative(html, 'svg');
 
   // Remove epub:type and namespace attributes
   html = html.replace(/\s+epub:[a-zA-Z-]+="[^"]*"/g, '');
   html = html.replace(/\s+xmlns:[a-zA-Z0-9]+="[^"]*"/g, '');
+
+  // Replace relative image src references with base64 data URIs
+  html = replaceImageSrcs(html, imageMap, chapterPath);
 
   return html.trim();
 }
@@ -141,10 +167,29 @@ export async function parseEpub(buffer: Buffer): Promise<EpubData> {
   // Build manifest: id -> href map
   const manifest = pkg?.manifest?.[0]?.item ?? [];
   const idToHref: Record<string, string> = {};
+
+  // Build image map: absolute path -> base64 data URI
+  const imageMap = new Map<string, string>();
+
   for (const item of manifest) {
     const attrs = item?.['$'] ?? {};
     if (attrs.id && attrs.href) {
       idToHref[attrs.id] = resolvePath(opfPath, attrs.href);
+    }
+    // Extract images and store as base64 data URIs
+    const mediaType: string = attrs['media-type'] ?? '';
+    if (mediaType.startsWith('image/') && attrs.href) {
+      const absPath = resolvePath(opfPath, attrs.href);
+      const imageFile = zip.file(absPath);
+      if (imageFile) {
+        const imageBase64 = await imageFile.async('base64');
+        const dataUri = `data:${mediaType};base64,${imageBase64}`;
+        // Index by absolute path, relative href, and basename
+        imageMap.set(absPath, dataUri);
+        imageMap.set(attrs.href, dataUri);
+        const basename = absPath.split('/').pop() ?? '';
+        if (basename) imageMap.set(basename, dataUri);
+      }
     }
   }
 
@@ -178,7 +223,7 @@ export async function parseEpub(buffer: Buffer): Promise<EpubData> {
     const file = zip.file(href);
     if (!file) continue;
     const raw = await file.async('text');
-    const cleaned = cleanChapterHtml(raw);
+    const cleaned = cleanChapterHtml(raw, imageMap, href);
     if (cleaned.trim()) {
       chapterParts.push(`<div class="chapter">\n${cleaned}\n</div>`);
     }
