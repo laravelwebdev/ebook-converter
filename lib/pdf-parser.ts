@@ -1,6 +1,8 @@
 /**
  * PDF parser: extracts text from PDF files while removing headers,
  * footers, and page numbers, then structures content by chapter.
+ * Uses calibre-inspired heuristics for paragraph reconstruction and
+ * header/footer detection.
  */
 
 import pdfParse from 'pdf-parse';
@@ -14,6 +16,7 @@ export interface PdfData {
 interface PageText {
   pageNum: number;
   lines: string[];
+  yPositions: number[]; // Y coordinate for each line (descending = top of page)
 }
 
 /** Normalize whitespace and trim a line. */
@@ -41,25 +44,25 @@ function lineFingerprint(line: string): string {
 
 /**
  * Detect header/footer lines that appear in many pages.
+ * Uses calibre-inspired approach: check top and bottom margins of each page.
  * Returns a set of line fingerprints to remove.
  */
-function detectRecurringLines(pages: PageText[], threshold = 0.4): Set<string> {
-  if (pages.length < 3) return new Set();
+function detectRecurringLines(pages: PageText[], threshold = 0.3): Set<string> {
+  if (pages.length < 2) return new Set();
 
   const fingerprintCounts: Map<string, number> = new Map();
-  const fingerprintExamples: Map<string, string> = new Map();
 
-  // Only examine the first 2 and last 2 lines of each page (where headers/footers appear)
+  // Examine the first 3 and last 3 lines of each page (where headers/footers appear)
   for (const page of pages) {
     const candidates = new Set<string>();
-    const firstLines = page.lines.slice(0, 2);
-    const lastLines = page.lines.slice(-2);
+    const checkCount = Math.min(3, Math.floor(page.lines.length / 2));
+    const firstLines = page.lines.slice(0, checkCount);
+    const lastLines = page.lines.slice(-checkCount);
 
     for (const line of [...firstLines, ...lastLines]) {
       if (line.length > 0) {
         const fp = lineFingerprint(line);
-        if (fp.length > 1) candidates.add(fp); // skip trivially short lines
-        fingerprintExamples.set(fp, line);
+        if (fp.length > 1) candidates.add(fp);
       }
     }
 
@@ -109,22 +112,52 @@ function isChapterHeading(line: string): { level: number; text: string } | null 
   return null;
 }
 
-/** Convert extracted PDF lines to clean HTML. */
-function linesToHtml(lines: string[]): string {
+/** Default line spacing in points when no lines are available to compute from. */
+const DEFAULT_LINE_SPACING = 14;
+/** Maximum gap between adjacent lines to consider for spacing statistics (filters page transitions). */
+const MAX_LINE_GAP_FOR_STATS = 100;
+/** A Y-position gap larger than this multiple of the median line spacing is treated as a paragraph break. */
+const PARAGRAPH_GAP_MULTIPLIER = 1.5;
+
+/**
+ * Compute the median line spacing from a flat list of lines with Y positions.
+ * Used to detect paragraph breaks (gaps significantly larger than normal line spacing).
+ */
+function computeMedianLineSpacing(yPositions: number[]): number {
+  if (yPositions.length < 2) return DEFAULT_LINE_SPACING;
+  const gaps: number[] = [];
+  for (let i = 1; i < yPositions.length; i++) {
+    const gap = Math.abs(yPositions[i - 1] - yPositions[i]);
+    if (gap > 0 && gap < MAX_LINE_GAP_FOR_STATS) gaps.push(gap);
+  }
+  if (gaps.length === 0) return DEFAULT_LINE_SPACING;
+  gaps.sort((a, b) => a - b);
+  return gaps[Math.floor(gaps.length / 2)];
+}
+
+/**
+ * Convert extracted PDF lines to clean HTML using Y-position-based paragraph detection.
+ * Uses calibre-inspired heuristics: a gap larger than 1.5x the typical line spacing
+ * indicates a paragraph break.
+ */
+function linesToHtml(lines: string[], yPositions: number[]): string {
   const parts: string[] = [];
-  let inParagraph = false;
   let paragraphLines: string[] = [];
+
+  const medianSpacing = computeMedianLineSpacing(yPositions);
+  const paragraphGapThreshold = medianSpacing * PARAGRAPH_GAP_MULTIPLIER;
 
   const flushParagraph = () => {
     if (paragraphLines.length > 0) {
       const text = paragraphLines.join(' ').trim();
       if (text) parts.push(`<p>${escapeHtml(text)}</p>`);
       paragraphLines = [];
-      inParagraph = false;
     }
   };
 
-  for (const line of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
     if (line.trim() === '') {
       flushParagraph();
       continue;
@@ -138,16 +171,15 @@ function linesToHtml(lines: string[]): string {
       continue;
     }
 
-    // Detect likely paragraph ends (line ends with ., ?, !, or is short relative to typical line)
-    paragraphLines.push(line);
-    inParagraph = true;
-
-    const endsWithPunctuation = /[.?!:;]$/.test(line);
-    const isShortLine = line.length < 40;
-
-    if (endsWithPunctuation || (isShortLine && paragraphLines.length > 0)) {
-      flushParagraph();
+    // Check for a paragraph break using Y-position gap
+    if (i > 0 && yPositions[i] !== undefined && yPositions[i - 1] !== undefined) {
+      const gap = Math.abs(yPositions[i - 1] - yPositions[i]);
+      if (gap > paragraphGapThreshold) {
+        flushParagraph();
+      }
     }
+
+    paragraphLines.push(line);
   }
 
   flushParagraph();
@@ -200,12 +232,16 @@ export async function parsePdf(buffer: Buffer, filename?: string): Promise<PdfDa
         // Sort by Y descending (top of page first in PDF coordinate space)
         const sortedYs = Array.from(yBuckets.keys()).sort((a, b) => b - a);
         const lines: string[] = [];
+        const yPositions: number[] = [];
         for (const y of sortedYs) {
           const lineText = normLine(yBuckets.get(y)!.join(''));
-          if (lineText.length > 0) lines.push(lineText);
+          if (lineText.length > 0) {
+            lines.push(lineText);
+            yPositions.push(y);
+          }
         }
 
-        pages.push({ pageNum: currentPage, lines });
+        pages.push({ pageNum: currentPage, lines, yPositions });
         return ''; // we don't need the default text output
       });
     },
@@ -225,8 +261,11 @@ export async function parsePdf(buffer: Buffer, filename?: string): Promise<PdfDa
   const recurringFPs = detectRecurringLines(pages);
 
   // Clean each page: remove headers, footers, page numbers
-  const cleanedPages: string[][] = pages.map((page) => {
-    const filtered: string[] = [];
+  const cleanedPages: { lines: string[]; yPositions: number[] }[] = pages.map((page) => {
+    const filteredLines: string[] = [];
+    const filteredYs: number[] = [];
+    const checkCount = Math.min(3, Math.floor(page.lines.length / 2));
+
     for (let i = 0; i < page.lines.length; i++) {
       const line = page.lines[i];
       const fp = lineFingerprint(line);
@@ -234,23 +273,30 @@ export async function parsePdf(buffer: Buffer, filename?: string): Promise<PdfDa
       // Skip page numbers
       if (isPageNumber(line)) continue;
 
-      // Skip lines matching recurring header/footer patterns
-      // (check first 2 and last 2 positions)
-      const isFirstOrLast = i < 2 || i >= page.lines.length - 2;
-      if (isFirstOrLast && recurringFPs.has(fp)) continue;
+      // Skip lines matching recurring header/footer patterns at top/bottom margins
+      const isTopMargin = i < checkCount;
+      const isBottomMargin = i >= page.lines.length - checkCount;
+      if ((isTopMargin || isBottomMargin) && recurringFPs.has(fp)) continue;
 
-      filtered.push(line);
+      filteredLines.push(line);
+      filteredYs.push(page.yPositions[i] ?? 0);
     }
-    return filtered;
+    return { lines: filteredLines, yPositions: filteredYs };
   });
 
-  // Merge all lines and convert to HTML
+  // Merge all lines and Y positions across pages
   const allLines: string[] = [];
+  const allYs: number[] = [];
   for (let i = 0; i < cleanedPages.length; i++) {
-    allLines.push(...cleanedPages[i]);
-    if (i < cleanedPages.length - 1) allLines.push(''); // blank line between pages
+    allLines.push(...cleanedPages[i].lines);
+    allYs.push(...cleanedPages[i].yPositions);
+    if (i < cleanedPages.length - 1) {
+      // Insert a blank line sentinel between pages (with a large Y gap to force paragraph break)
+      allLines.push('');
+      allYs.push(0);
+    }
   }
 
-  const html = linesToHtml(allLines);
+  const html = linesToHtml(allLines, allYs);
   return { title, author, html };
 }
